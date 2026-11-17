@@ -147,7 +147,8 @@ jobs:
               if 'signAllPublications()' in txt:
                   f.write_text(txt.replace('signAllPublications()', '// disabled-for-arm64: signAllPublications()'))
 
-          # 3) backend/native/backend/Makefile: arm64-only + rule + copy mapping
+          # 3) backend/native/backend/Makefile: arm64-only + rule + rewrite
+          #    copy_to_resources for the arm64-only build
           p = pathlib.Path('backend/native/backend/Makefile')
           m = p.read_text()
           m = m.replace('PLATFORMS := linux-amd64 windows-amd64', 'PLATFORMS := linux-arm64')
@@ -157,10 +158,15 @@ jobs:
           arm_block = block.replace('linux-amd64', 'linux-arm64').replace('GOARCH=amd64', 'GOARCH=arm64')
           if 'libwg-linux-arm64.so:' not in m:
               m = m[:end] + '\n' + arm_block + m[end:]
-          old_map = 'if [ "$$os" = "linux" ] && [ "$$arch" = "amd64" ]; then subdir=linux-x64; fi;'
-          new_map = old_map + '\n\t\tif [ "$$os" = "linux" ] && [ "$$arch" = "arm64" ]; then subdir=linux-aarch64; fi;'
+          start = m.index('copy_to_resources: build_all')
+          clean_idx = m.index('\nclean:', start)
+          new_c2r = '''copy_to_resources: build_all
+\t@mkdir -p "$(RESOURCEDIR)/linux-aarch64"
+\t@cp "$(DESTDIR)/libwg-linux-arm64.so" "$(RESOURCEDIR)/linux-aarch64/libwg.so"
+\t@echo "Copied linux-arm64 -> $(RESOURCEDIR)/linux-aarch64/libwg.so"
+'''
           if 'linux-aarch64' not in m:
-              m = m.replace(old_map, new_map)
+              m = m[:start] + new_c2r + m[clean_idx:]
           p.write_text(m)
           print("core patched ok")
           PY
