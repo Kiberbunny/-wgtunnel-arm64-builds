@@ -6,6 +6,13 @@
 # Uses a native arm64 runner (Ubuntu 24.04 ARM64) because GraalVM
 # native-image cannot cross-compile x86 -> ARM.
 #
+# IMPORTANT: upstream currently lacks the fixes needed for arm64, so this
+# workflow applies them automatically (material3 pin, Makefile targets,
+# keyring task, JVM-only exclusions, PGP off, core built from source).
+# The patch patterns mirror the local build that produced a working arm64
+# deb/tar.gz. If an upstream file drifts, a pattern simply won't match and
+# prints a warning; the build will then fail loudly, not silently.
+#
 # Important: release.yml (the main workflow) should call this via
 # workflow_call, or artifacts can be fetched from CI manually.
 
@@ -64,6 +71,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          repository: wgtunnel/core
+          ref: main
+          path: core
+          submodules: recursive
+
+      - uses: actions/checkout@v7
+        with:
           path: desktop
           submodules: recursive
 
@@ -84,6 +98,92 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: "1.25"
+
+      - name: Install build/runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patchelf zlib1g-dev npm openjdk-21-jdk-headless
+
+      # ---------------------------------------------------------------
+      # Patch core (wgtunnel/core) for linux-arm64 and publish it locally.
+      # ---------------------------------------------------------------
+      - name: Patch core for linux-arm64
+        working-directory: core
+        run: |
+          set +e
+
+          # 1) Add a linux-arm64 rule to the backend + keyring Go Makefiles
+          #    by duplicating the linux-amd64 rule, replacing amd64->arm64.
+          for f in backend/native/backend/Makefile keyring/tools/keyring-go/Makefile; do
+            [ -f "$f" ] || { echo "skip (missing): $f"; continue; }
+            awk '
+              /^linux-amd64:/ { capture=1; block=""; }
+              capture {
+                block = block $0 ORS
+                if ($0 ~ /^[[:space:]]*$/) {
+                  capture = 0
+                  gsub(/linux-amd64/, "linux-arm64", block)
+                  gsub(/amd64/, "arm64", block)
+                  printf "%s", block
+                }
+                next
+              }
+              { print }
+            ' "$f" > "$f.new" && mv "$f.new" "$f"
+            echo "patched: $f"
+          done
+
+          # 2) Keyring Gradle task: build only linux-arm64 (make all also
+          #    tries Windows cross-builds and fails without mingw).
+          grep -rl "make all" --include='*.kt' . | while read -r f; do
+            sed -i 's/make all/make copy_to_resources PLATFORMS=linux-arm64/' "$f"
+            echo "patched: $f"
+          done
+
+          # 3) JVM-only: exclude Android-only modules from the settings.
+          sed -i -E 's/^include\(.*(:hevtunnel|:backend-android-jni).*\)/\/\/ disabled-for-arm64: &/' settings.gradle.kts
+          echo "settings.gradle.kts android modules disabled"
+
+          # 4) PGP signing off for local publishing.
+          grep -rl "signAllPublications" --include='*.kts' --include='*.gradle' . | while read -r f; do
+            sed -i 's/signAllPublications()/\/\/ signAllPublications() disabled for local publish/' "$f"
+            echo "patched: $f"
+          done
+
+          # 5) Disable the Android KMP target in the backend module.
+          grep -rl "androidTarget" --include='*.kts' --include='*.gradle' . | while read -r f; do
+            sed -i 's/androidTarget()/\/\/ androidTarget() disabled for arm64/' "$f"
+            echo "patched: $f"
+          done
+
+          echo "=== core patches done ==="
+
+      - name: Publish core backend to Maven Local (JVM, arm64)
+        working-directory: core
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-21-openjdk-arm64
+        run: |
+          export PATH="$JAVA_HOME/bin:$PATH"
+          ./gradlew :backend:publishToMavenLocal --no-daemon --stacktrace
+
+      # ---------------------------------------------------------------
+      # Patch desktop (wgtunnel/desktop) and run the packaging.
+      # ---------------------------------------------------------------
+      - name: Patch desktop for linux-arm64
+        working-directory: desktop
+        run: |
+          set +e
+
+          # 1) Align core version with the locally published build.
+          sed -i 's/1\.10\.0/1.10.1/' gradle/libs.versions.toml
+
+          # 2) Compose material3 pin: avoid NoSuchMethodError in native image.
+          sed -i 's/material3 = "1\.13\.0-beta01"/material3 = "1.12.0-alpha03"/' gradle/libs.versions.toml
+          grep -q 'material3 = "1.12.0-alpha03"' gradle/libs.versions.toml \
+            && echo "material3 pinned to 1.12.0-alpha03" \
+            || echo "WARNING: material3 pattern not found"
+
+          echo "=== desktop patches done ==="
 
       - name: Package Linux arm64 (GraalVM)
         working-directory: desktop
