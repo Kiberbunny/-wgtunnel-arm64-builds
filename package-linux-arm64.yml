@@ -67,7 +67,7 @@ jobs:
   package:
     name: package-linux-arm64
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
         with:
@@ -91,7 +91,6 @@ jobs:
           java-version: "25"
           packaging-tools: "true"
           setup-gradle: "true"
-          setup-node: "true"
           graalvm: "true"
 
       - uses: actions/setup-go@v7
@@ -101,7 +100,7 @@ jobs:
       - name: Install build/runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y patchelf zlib1g-dev npm openjdk-21-jdk-headless
+          sudo apt-get install -y build-essential patch patchelf zlib1g-dev npm openjdk-21-jdk-headless
 
       # ---------------------------------------------------------------
       # Patch core (wgtunnel/core) for linux-arm64 and publish it locally.
@@ -109,61 +108,70 @@ jobs:
       - name: Patch core for linux-arm64
         working-directory: core
         run: |
-          set +e
+          python3 - <<'PY'
+          import pathlib
 
-          # 1) Add a linux-arm64 rule to the backend + keyring Go Makefiles
-          #    by duplicating the linux-amd64 rule, replacing amd64->arm64.
-          for f in backend/native/backend/Makefile keyring/tools/keyring-go/Makefile; do
-            [ -f "$f" ] || { echo "skip (missing): $f"; continue; }
-            awk '
-              /^linux-amd64:/ { capture=1; block=""; }
-              capture {
-                block = block $0 ORS
-                if ($0 ~ /^[[:space:]]*$/) {
-                  capture = 0
-                  gsub(/linux-amd64/, "linux-arm64", block)
-                  gsub(/amd64/, "arm64", block)
-                  printf "%s", block
-                }
-                next
-              }
-              { print }
-            ' "$f" > "$f.new" && mv "$f.new" "$f"
-            echo "patched: $f"
-          done
+          # 1) settings.gradle.kts: exclude Android-only modules
+          p = pathlib.Path('settings.gradle.kts')
+          s = p.read_text()
+          s = s.replace('include(":hevtunnel")', '// disabled-for-arm64: include(":hevtunnel")')
+          s = s.replace('include(":backend-android-jni")', '// disabled-for-arm64: include(":backend-android-jni")')
+          p.write_text(s)
 
-          # 2) Keyring Gradle task: build only linux-arm64 (make all also
-          #    tries Windows cross-builds and fails without mingw).
-          grep -rl "make all" --include='*.kt' . | while read -r f; do
-            sed -i 's/make all/make copy_to_resources PLATFORMS=linux-arm64/' "$f"
-            echo "patched: $f"
-          done
+          # 2) backend/build.gradle.kts: strip Android plugin/target/sourceSet, PGP off
+          p = pathlib.Path('backend/build.gradle.kts')
+          b = p.read_text()
+          b = b.replace('    alias(libs.plugins.android.kotlin.multiplatform.library)',
+                        '    // disabled-for-arm64: alias(libs.plugins.android.kotlin.multiplatform.library)')
 
-          # 3) JVM-only: exclude Android-only modules from the settings.
-          sed -i -E 's/^include\(.*(:hevtunnel|:backend-android-jni).*\)/\/\/ disabled-for-arm64: &/' settings.gradle.kts
-          echo "settings.gradle.kts android modules disabled"
+          def drop_block(text, start, end):
+              out, skipping = [], False
+              for ln in text.split('\n'):
+                  if not skipping and ln == start:
+                      skipping = True
+                      continue
+                  if skipping:
+                      if ln == end:
+                          skipping = False
+                      continue
+                  out.append(ln)
+              return '\n'.join(out)
 
-          # 4) PGP signing off for local publishing.
-          grep -rl "signAllPublications" --include='*.kts' --include='*.gradle' . | while read -r f; do
-            sed -i 's/signAllPublications()/\/\/ signAllPublications() disabled for local publish/' "$f"
-            echo "patched: $f"
-          done
+          b = drop_block(b, '    android {', '    }')
+          b = drop_block(b, '        androidMain.dependencies {', '        }')
+          p.write_text(b)
 
-          # 5) Disable the Android KMP target in the backend module.
-          grep -rl "androidTarget" --include='*.kts' --include='*.gradle' . | while read -r f; do
-            sed -i 's/androidTarget()/\/\/ androidTarget() disabled for arm64/' "$f"
-            echo "patched: $f"
-          done
+          # PGP signing off for local publishing (backend + parser + any other .kts)
+          for f in pathlib.Path('.').rglob('*.kts'):
+              txt = f.read_text()
+              if 'signAllPublications()' in txt:
+                  f.write_text(txt.replace('signAllPublications()', '// disabled-for-arm64: signAllPublications()'))
 
-          echo "=== core patches done ==="
+          # 3) backend/native/backend/Makefile: arm64-only + rule + copy mapping
+          p = pathlib.Path('backend/native/backend/Makefile')
+          m = p.read_text()
+          m = m.replace('PLATFORMS := linux-amd64 windows-amd64', 'PLATFORMS := linux-arm64')
+          idx = m.index('$(DESTDIR)/libwg-linux-amd64.so:')
+          end = m.index('\n\n', idx)
+          block = m[idx:end]
+          arm_block = block.replace('linux-amd64', 'linux-arm64').replace('GOARCH=amd64', 'GOARCH=arm64')
+          if 'libwg-linux-arm64.so:' not in m:
+              m = m[:end] + '\n' + arm_block + m[end:]
+          old_map = 'if [ "$$os" = "linux" ] && [ "$$arch" = "amd64" ]; then subdir=linux-x64; fi;'
+          new_map = old_map + '\n\t\tif [ "$$os" = "linux" ] && [ "$$arch" = "arm64" ]; then subdir=linux-aarch64; fi;'
+          if 'linux-aarch64' not in m:
+              m = m.replace(old_map, new_map)
+          p.write_text(m)
+          print("core patched ok")
+          PY
 
-      - name: Publish core backend to Maven Local (JVM, arm64)
+      - name: Publish core to Maven Local (JVM, arm64)
         working-directory: core
         env:
           JAVA_HOME: /usr/lib/jvm/java-21-openjdk-arm64
         run: |
           export PATH="$JAVA_HOME/bin:$PATH"
-          ./gradlew :backend:publishToMavenLocal --no-daemon --stacktrace
+          ./gradlew publishToMavenLocal --no-daemon --stacktrace
 
       # ---------------------------------------------------------------
       # Patch desktop (wgtunnel/desktop) and run the packaging.
@@ -171,18 +179,37 @@ jobs:
       - name: Patch desktop for linux-arm64
         working-directory: desktop
         run: |
-          set +e
+          python3 - <<'PY'
+          import pathlib
 
-          # 1) Align core version with the locally published build.
-          sed -i 's/1\.10\.0/1.10.1/' gradle/libs.versions.toml
+          # 1) gradle/libs.versions.toml: core version + material3 pin
+          p = pathlib.Path('gradle/libs.versions.toml')
+          t = p.read_text()
+          t = t.replace('core = "1.10.0"', 'core = "1.10.1"')
+          t = t.replace('material3 = "1.13.0-beta01"', 'material3 = "1.12.0-alpha03"')
+          p.write_text(t)
 
-          # 2) Compose material3 pin: avoid NoSuchMethodError in native image.
-          sed -i 's/material3 = "1\.13\.0-beta01"/material3 = "1.12.0-alpha03"/' gradle/libs.versions.toml
-          grep -q 'material3 = "1.12.0-alpha03"' gradle/libs.versions.toml \
-            && echo "material3 pinned to 1.12.0-alpha03" \
-            || echo "WARNING: material3 pattern not found"
+          # 2) keyring/tools/keyring-go/Makefile: arm64 rule
+          p = pathlib.Path('keyring/tools/keyring-go/Makefile')
+          m = p.read_text()
+          m = m.replace('PLATFORMS := linux-amd64 windows-amd64', 'PLATFORMS := linux-arm64')
+          idx = m.index('$(DESTDIR)/libkeyring-linux-amd64.so:')
+          end = m.index('\n\n', idx)
+          block = m[idx:end]
+          arm_block = block.replace('linux-amd64', 'linux-arm64').replace('GOARCH=amd64', 'GOARCH=arm64')
+          if 'libkeyring-linux-arm64.so:' not in m:
+              m = m[:end] + '\n' + arm_block + m[end:]
+          p.write_text(m)
 
-          echo "=== desktop patches done ==="
+          # 3) Keyring Gradle task: build only linux-arm64 (make all tries
+          #    Windows cross-builds and fails without mingw).
+          for f in pathlib.Path('.').rglob('*.kt'):
+              txt = f.read_text()
+              if 'make all' in txt:
+                  f.write_text(txt.replace('make all', 'make copy_to_resources PLATFORMS=linux-arm64'))
+                  print('patched keyring task:', f)
+          print("desktop patched ok")
+          PY
 
       - name: Package Linux arm64 (GraalVM)
         working-directory: desktop
