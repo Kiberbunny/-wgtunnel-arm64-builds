@@ -77,6 +77,7 @@ jobs:
 
       - uses: actions/checkout@v7
         with:
+          repository: wgtunnel/desktop
           path: desktop
           submodules: recursive
 
@@ -212,8 +213,11 @@ jobs:
           #    Windows cross-builds and fails without mingw).
           for f in pathlib.Path('.').rglob('*.kt'):
               txt = f.read_text()
-              if 'make all' in txt:
-                  f.write_text(txt.replace('make all', 'make copy_to_resources PLATFORMS=linux-arm64'))
+              if 'commandLine("make", "all")' in txt:
+                  f.write_text(txt.replace(
+                      'commandLine("make", "all")',
+                      'commandLine("make", "copy_to_resources", "PLATFORMS=linux-arm64")',
+                  ))
                   print('patched keyring task:', f)
           print("desktop patched ok")
           PY
