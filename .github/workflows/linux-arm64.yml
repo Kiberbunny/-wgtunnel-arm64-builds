@@ -160,11 +160,12 @@ jobs:
               m = m[:end] + '\n' + arm_block + m[end:]
           start = m.index('copy_to_resources: build_all')
           clean_idx = m.index('\nclean:', start)
-          new_c2r = '''copy_to_resources: build_all
-\t@mkdir -p "$(RESOURCEDIR)/linux-aarch64"
-\t@cp "$(DESTDIR)/libwg-linux-arm64.so" "$(RESOURCEDIR)/linux-aarch64/libwg.so"
-\t@echo "Copied linux-arm64 -> $(RESOURCEDIR)/linux-aarch64/libwg.so"
-'''
+          new_c2r = (
+              'copy_to_resources: build_all\n'
+              '\t@mkdir -p "$(RESOURCEDIR)/linux-aarch64"\n'
+              '\t@cp "$(DESTDIR)/libwg-linux-arm64.so" "$(RESOURCEDIR)/linux-aarch64/libwg.so"\n'
+              '\t@echo "Copied linux-arm64 -> $(RESOURCEDIR)/linux-aarch64/libwg.so"\n'
+          )
           if 'linux-aarch64' not in m:
               m = m[:start] + new_c2r + m[clean_idx:]
           p.write_text(m)
